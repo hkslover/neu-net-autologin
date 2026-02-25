@@ -8,11 +8,10 @@ import json
 import time
 import hashlib
 import hmac
+import os
 import base64
 import requests
 from urllib.parse import urlencode, quote, urlparse
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.hazmat.primitives.serialization import load_der_public_key
 
 
 class NEULogin:
@@ -55,14 +54,69 @@ class NEULogin:
             "Upgrade-Insecure-Requests": "1"
         }
     
+    @staticmethod
+    def _parse_der_public_key(der_bytes: bytes) -> tuple:
+        """解析DER编码的SubjectPublicKeyInfo，提取RSA公钥(n, e)"""
+        def read_tag_length(data, pos):
+            tag = data[pos]; pos += 1
+            length = data[pos]; pos += 1
+            if length & 0x80:
+                num_bytes = length & 0x7f
+                length = int.from_bytes(data[pos:pos + num_bytes], 'big')
+                pos += num_bytes
+            return tag, length, pos
+
+        def read_integer(data, pos):
+            tag, length, pos = read_tag_length(data, pos)
+            assert tag == 0x02, f"Expected INTEGER (0x02), got {hex(tag)}"
+            value = int.from_bytes(data[pos:pos + length], 'big')
+            return value, pos + length
+
+        pos = 0
+        # 外层 SEQUENCE (SubjectPublicKeyInfo)
+        tag, length, pos = read_tag_length(der_bytes, pos)
+        assert tag == 0x30
+        # AlgorithmIdentifier SEQUENCE — 跳过
+        tag, length, pos = read_tag_length(der_bytes, pos)
+        assert tag == 0x30
+        pos += length
+        # BIT STRING
+        tag, length, pos = read_tag_length(der_bytes, pos)
+        assert tag == 0x03
+        pos += 1  # 跳过 unused-bits 字节
+        # 内层 SEQUENCE (RSAPublicKey)
+        tag, length, pos = read_tag_length(der_bytes, pos)
+        assert tag == 0x30
+        # 读取 n 和 e
+        n, pos = read_integer(der_bytes, pos)
+        e, pos = read_integer(der_bytes, pos)
+        return n, e
+
     def _rsa_encrypt(self, plaintext: str) -> str:
-        """使用RSA公钥加密（PKCS1v15填充）"""
-        public_key_der = base64.b64decode(self.RSA_PUBLIC_KEY)
-        public_key = load_der_public_key(public_key_der)
-        encrypted = public_key.encrypt(
-            plaintext.encode('utf-8'),
-            asym_padding.PKCS1v15()
-        )
+        """使用RSA公钥加密（PKCS1v15填充）—— 纯Python实现，无需第三方库"""
+        der_bytes = base64.b64decode(self.RSA_PUBLIC_KEY)
+        n, e = self._parse_der_public_key(der_bytes)
+        key_size = (n.bit_length() + 7) // 8  # 密钥字节长度
+
+        msg_bytes = plaintext.encode('utf-8')
+        if len(msg_bytes) > key_size - 11:
+            raise ValueError("消息过长，超出此RSA密钥可加密的上限")
+
+        # PKCS#1 v1.5 填充: 0x00 0x02 [随机非零字节] 0x00 [明文]
+        pad_len = key_size - len(msg_bytes) - 3
+        padding = b''
+        while len(padding) < pad_len:
+            chunk = os.urandom(pad_len - len(padding))
+            padding += bytes(b for b in chunk if b != 0)
+        padding = padding[:pad_len]
+
+        padded = b'\x00\x02' + padding + b'\x00' + msg_bytes
+
+        # RSA 核心运算: ciphertext = plaintext^e mod n
+        m_int = int.from_bytes(padded, 'big')
+        c_int = pow(m_int, e, n)
+        encrypted = c_int.to_bytes(key_size, 'big')
+
         return base64.b64encode(encrypted).decode('utf-8')
     
     def _parse_field(self, html: str, name: str) -> str | None:
