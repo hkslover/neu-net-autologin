@@ -1,6 +1,6 @@
 """
 东北大学校园网自动登录 - Python版本
-基于Scriptable脚本逻辑改写，支持深澜(srun)认证
+支持深澜(srun)认证
 """
 
 import re
@@ -8,8 +8,11 @@ import json
 import time
 import hashlib
 import hmac
+import base64
 import requests
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urlparse
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.serialization import load_der_public_key
 
 
 class NEULogin:
@@ -29,6 +32,8 @@ class NEULogin:
     N = "200"
     TYPE = "1"
     ENC = "srun_bx1"
+    # CAS RSA公钥（从login_neu.js提取）
+    RSA_PUBLIC_KEY = "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKs2qmEOHBN7PF6O2M5UdvgLcs2tggpQ6gbypkz5mLFmWi8VCwyKM9guLhUu0TvolcrVvS9G51BOvJSKAsclJ3sCAwEAAQ=="
     
     def __init__(self):
         self.session = requests.Session()
@@ -49,6 +54,16 @@ class NEULogin:
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1"
         }
+    
+    def _rsa_encrypt(self, plaintext: str) -> str:
+        """使用RSA公钥加密（PKCS1v15填充）"""
+        public_key_der = base64.b64decode(self.RSA_PUBLIC_KEY)
+        public_key = load_der_public_key(public_key_der)
+        encrypted = public_key.encrypt(
+            plaintext.encode('utf-8'),
+            asym_padding.PKCS1v15()
+        )
+        return base64.b64encode(encrypted).decode('utf-8')
     
     def _parse_field(self, html: str, name: str) -> str | None:
         """解析HTML中的隐藏字段值"""
@@ -221,25 +236,17 @@ class NEULogin:
             if not username or not password:
                 raise Exception("用户名或密码不能为空")
             
+            # 每次登录使用全新的session，避免旧cookie干扰
+            self.session = requests.Session()
+            self.session.headers.update(self._default_headers())
+            self.session.verify = False
+            self.session.timeout = 30
+            
             print("开始登录流程...")
             
-            # ========== 第一步：访问校园网页面，获取SSO登录入口 ==========
-            print("\n===== 步骤1: 获取SSO登录入口 =====")
+            # ========== 第一步：构建CAS登录URL ==========
+            print("\n===== 步骤1: CAS统一身份认证 =====")
             
-            # 访问校园网首页
-            portal_resp = self.session.get(self.SRUN_PORTAL, allow_redirects=True)
-            print(f"校园网页面状态: {portal_resp.status_code}")
-            
-            # 检查是否已经在线
-            if 'success' in portal_resp.text and '网络已连接' in portal_resp.text:
-                print("✅ 已经在线！")
-                return {"success": True, "message": "校园网已连接（之前已登录）", "data": {}}
-            
-            # ========== 第二步：构建CAS登录URL（模拟点击"连接网络"按钮） ==========
-            print("\n===== 步骤2: CAS统一身份认证 =====")
-            
-            # CAS登录URL - service指向校园网SSO回调
-            # 这是"连接网络"按钮跳转的URL
             cas_service_url = "http://ipgw.neu.edu.cn/srun_portal_sso?ac_id=1"
             cas_login_url = f"{self.LOGIN_POINT}?service={quote(cas_service_url, safe='')}"
             
@@ -248,86 +255,43 @@ class NEULogin:
             # 获取CAS登录页面
             cas_resp = self.session.get(cas_login_url, allow_redirects=True)
             print(f"CAS页面状态: {cas_resp.status_code}")
-            print(f"CAS当前URL: {cas_resp.url}")
+            print(f"CAS最终URL: {cas_resp.url}")
             
-            # 检查是否已经有CAS会话（直接跳转到了校园网）
-            if 'ipgw.neu.edu.cn' in cas_resp.url:
-                print("✅ 已有CAS会话，直接跳转到校园网")
-                # 检查是否登录成功
-                if 'success' in cas_resp.text or '网络已连接' in cas_resp.text:
+            # 判断是否被重定向到了校园网（只检查hostname，不检查查询参数）
+            final_host = urlparse(cas_resp.url).hostname
+            
+            if final_host and 'ipgw.neu.edu.cn' in final_host:
+                print("✅ CAS会话有效，已重定向到校园网")
+                
+                # 已经到达校园网页面，检查是否登录成功
+                if '网络已连接' in cas_resp.text:
                     print("✅ 登录成功！")
                     return {"success": True, "message": "校园网登录成功", "data": {}}
                 
-                # 检查URL中是否有ticket，如果有则直接进行SSO认证
+                # 页面可能还需要完成SSO认证
                 if 'ticket=' in cas_resp.url:
                     ticket = self._extract_ticket_from_url(cas_resp.url)
-                    print(f"✅ 从重定向URL获取到ticket: {ticket}")
+                    print(f"获取到ticket: {ticket}")
+                    return self._complete_sso(ticket)
                     
-                    # 访问v1 SSO接口
-                    sso_url = f"{self.SRUN_SSO_URL}?ac_id=1&ticket={ticket}"
-                    print(f"SSO URL: {sso_url}")
-                    
-                    sso_resp = self.session.get(sso_url, allow_redirects=True)
-                    print(f"SSO响应状态: {sso_resp.status_code}")
-                    
-                    # 检查SSO认证结果
-                    if 'success' in sso_resp.text or '网络已连接' in sso_resp.text:
-                        print("✅ SSO认证成功！")
-                        return {"success": True, "message": "校园网登录成功", "data": {}}
-                    
-                    # 使用rad_user_info检查在线状态
-                    import time as t
-                    t.sleep(0.5)
-                    status = self.get_status()
-                    if status.get("online"):
-                        print("✅ 确认登录成功！")
-                        return {"success": True, "message": "校园网登录成功", "data": status.get("data", {})}
-                    
-                    # 如果SSO认证后仍未在线，继续尝试常规登录流程
-                    print("⚠️ SSO认证后未检测到在线状态，尝试重新获取CAS登录页面...")
-                    
-                    # 清除可能的过期cookie，重新获取登录页面
-                    self.session.cookies.clear()
-                    cas_resp = self.session.get(cas_login_url, allow_redirects=True)
-                    print(f"重新获取CAS页面状态: {cas_resp.status_code}")
-                    print(f"CAS当前URL: {cas_resp.url}")
-                    
-                    # 如果仍然直接跳转，说明CAS会话有效但ticket可能已过期
-                    if 'ipgw.neu.edu.cn' in cas_resp.url and 'ticket=' in cas_resp.url:
-                        # 尝试使用新的ticket
-                        new_ticket = self._extract_ticket_from_url(cas_resp.url)
-                        print(f"✅ 获取新ticket: {new_ticket}")
-                        sso_url = f"{self.SRUN_SSO_URL}?ac_id=1&ticket={new_ticket}"
-                        sso_resp = self.session.get(sso_url, allow_redirects=True)
-                        
-                        t.sleep(0.5)
-                        status = self.get_status()
-                        if status.get("online"):
-                            print("✅ 使用新ticket登录成功！")
-                            return {"success": True, "message": "校园网登录成功", "data": status.get("data", {})}
+                print("⚠️ 重定向到校园网但未完成认证")
             
-            # 需要进行CAS登录
+            # ========== 第二步：提交CAS登录表单 ==========
+            print("\n===== 步骤2: 提交CAS登录 =====")
+            
             cas_page = cas_resp.text
             self._ensure_not_error_page(cas_page)
             
-            # 检查页面是否包含登录表单（lt和execution字段）
-            lt = self._parse_field(cas_page, "lt")
-            execution = self._parse_field(cas_page, "execution")
-            
-            if not lt or not execution:
-                # 如果页面不是CAS登录页面，可能是其他情况
-                print(f"⚠️ 当前页面不是CAS登录页面，URL: {cas_resp.url}")
-                print(f"页面内容预览: {cas_page[:500]}")
-                raise Exception("无法获取CAS登录表单，请检查网络或重试")
-            
+            lt, execution = self._extract_lt_execution(cas_page)
             print(f"✅ lt: {lt[:40]}...")
             print(f"✅ execution: {execution}")
             
-            # ========== 第三步：提交CAS登录表单 ==========
-            print("\n===== 步骤3: 提交CAS登录 =====")
+            # CAS系统已升级为RSA加密: rsa = RSA_encrypt(username + password)
+            rsa_encrypted = self._rsa_encrypt(username + password)
+            print(f"✅ RSA加密完成，密文长度: {len(rsa_encrypted)}")
             
             payload = {
-                "rsa": username + password + lt,
+                "rsa": rsa_encrypted,
                 "ul": str(len(username)),
                 "pl": str(len(password)),
                 "lt": lt,
@@ -342,67 +306,92 @@ class NEULogin:
                 "Origin": self.BASE_URL
             }
             
-            # 提交登录，允许重定向
             login_resp = self.session.post(cas_login_url, data=payload, headers=headers, allow_redirects=True)
             
             print(f"登录响应状态: {login_resp.status_code}")
             print(f"登录后URL: {login_resp.url}")
             
-            # 检查是否登录成功
-            if 'success' in login_resp.text or '网络已连接' in login_resp.text:
-                print("✅ 登录成功！")
-                return {"success": True, "message": "校园网登录成功", "data": {"url": login_resp.url}}
+            # 处理HTTP 500等服务器错误 - 重试一次
+            if login_resp.status_code >= 500:
+                print("⚠️ CAS服务器错误，清除cookie后重试...")
+                self.session.cookies.clear()
+                cas_resp2 = self.session.get(cas_login_url, allow_redirects=True)
+                
+                final_host2 = urlparse(cas_resp2.url).hostname
+                if final_host2 and 'ipgw.neu.edu.cn' in final_host2:
+                    if 'ticket=' in cas_resp2.url:
+                        ticket = self._extract_ticket_from_url(cas_resp2.url)
+                        return self._complete_sso(ticket)
+                    if '网络已连接' in cas_resp2.text:
+                        return {"success": True, "message": "校园网登录成功", "data": {}}
+                
+                # 仍然在CAS页面，重新登录
+                lt2, execution2 = self._extract_lt_execution(cas_resp2.text)
+                payload["rsa"] = self._rsa_encrypt(username + password)
+                payload["lt"] = lt2
+                payload["execution"] = execution2
+                login_resp = self.session.post(cas_login_url, data=payload, headers=headers, allow_redirects=True)
+                print(f"重试登录响应状态: {login_resp.status_code}")
+                print(f"重试登录后URL: {login_resp.url}")
             
-            # 检查是否有错误信息
-            if '密码' in login_resp.text and '错误' in login_resp.text:
-                raise Exception("用户名或密码错误")
-            if 'error' in login_resp.text.lower():
-                print(f"页面内容: {login_resp.text[:500]}")
-                
-            # ========== 第四步：如果还没成功，尝试访问SSO URL ==========
-            print("\n===== 步骤4: 尝试SSO认证 =====")
+            # ========== 第三步：检查登录结果 ==========
+            print("\n===== 步骤3: 检查登录结果 =====")
             
-            # 检查URL中是否有ticket
-            if 'ticket=' in login_resp.url:
-                ticket = self._extract_ticket_from_url(login_resp.url)
-                print(f"获取到ticket: {ticket}")
-                
-                # 访问v1 SSO接口
-                sso_url = f"{self.SRUN_SSO_URL}?ac_id=1&ticket={ticket}"
-                print(f"SSO URL: {sso_url}")
-                
-                sso_resp = self.session.get(sso_url, allow_redirects=True)
-                print(f"SSO响应状态: {sso_resp.status_code}")
-                
-                # 再次检查页面
-                if 'success' in sso_resp.text or '网络已连接' in sso_resp.text:
-                    print("✅ SSO认证成功！")
+            login_final_host = urlparse(login_resp.url).hostname
+            
+            # 登录成功 - 已跳转到校园网
+            if login_final_host and 'ipgw.neu.edu.cn' in login_final_host:
+                if '网络已连接' in login_resp.text:
+                    print("✅ 登录成功！")
                     return {"success": True, "message": "校园网登录成功", "data": {}}
+                
+                if 'ticket=' in login_resp.url:
+                    ticket = self._extract_ticket_from_url(login_resp.url)
+                    print(f"获取到ticket: {ticket}")
+                    return self._complete_sso(ticket)
             
-            # ========== 第五步：最后检查在线状态 ==========
-            print("\n===== 步骤5: 检查在线状态 =====")
+            # 检查是否账号密码错误
+            if '密码' in login_resp.text or '认证失败' in login_resp.text or '错误' in login_resp.text:
+                raise Exception("用户名或密码错误")
             
-            # 等待一下
+            # ========== 第四步：最后检查在线状态 ==========
+            print("\n===== 步骤4: 检查在线状态 =====")
+            
             import time as t
             t.sleep(1)
             
-            # 再次访问校园网首页检查
-            check_resp = self.session.get(self.SRUN_PORTAL, allow_redirects=True)
-            if 'success' in check_resp.text or '网络已连接' in check_resp.text:
-                print("✅ 确认登录成功！")
-                return {"success": True, "message": "校园网登录成功", "data": {}}
-            
-            # 使用rad_user_info检查
             status = self.get_status()
             if status.get("online"):
+                print("✅ 确认登录成功！")
                 return {"success": True, "message": "校园网登录成功", "data": status.get("data", {})}
             
-            # 登录失败
             raise Exception("登录流程完成但未检测到在线状态，请检查账号密码或网络")
             
         except Exception as e:
             print(f"❌ 登录失败: {str(e)}")
             return {"success": False, "message": f"登录失败: {str(e)}"}
+    
+    def _complete_sso(self, ticket: str) -> dict:
+        """使用ticket完成IPGW SSO认证"""
+        import time as t
+        
+        print(f"\n===== 完成SSO认证 (ticket: {ticket[:20]}...) =====")
+        sso_url = f"{self.SRUN_SSO_URL}?ac_id=1&ticket={ticket}"
+        sso_resp = self.session.get(sso_url, allow_redirects=True)
+        print(f"SSO响应状态: {sso_resp.status_code}")
+        
+        if '网络已连接' in sso_resp.text:
+            print("✅ SSO认证成功！")
+            return {"success": True, "message": "校园网登录成功", "data": {}}
+        
+        # 等待后检查状态
+        t.sleep(1)
+        status = self.get_status()
+        if status.get("online"):
+            print("✅ SSO认证成功！")
+            return {"success": True, "message": "校园网登录成功", "data": status.get("data", {})}
+        
+        raise Exception("SSO认证完成但未检测到在线状态")
     
     def logout(self) -> dict:
         """
