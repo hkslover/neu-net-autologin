@@ -16,7 +16,7 @@ from urllib.parse import urlencode, quote, urlparse
 
 class NEULogin:
     """东北大学校园网登录类"""
-    
+
     # 基础配置
     BASE_URL = "https://pass.neu.edu.cn"
     LOGIN_POINT = f"{BASE_URL}/tpass/login"
@@ -31,8 +31,6 @@ class NEULogin:
     N = "200"
     TYPE = "1"
     ENC = "srun_bx1"
-    # CAS RSA公钥（从login_neu.js提取）
-    RSA_PUBLIC_KEY = "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKs2qmEOHBN7PF6O2M5UdvgLcs2tggpQ6gbypkz5mLFmWi8VCwyKM9guLhUu0TvolcrVvS9G51BOvJSKAsclJ3sCAwEAAQ=="
     
     def __init__(self):
         self.session = requests.Session()
@@ -41,6 +39,38 @@ class NEULogin:
         self.session.timeout = 30
         self.token = ""
         self.ip = ""
+        # 动态获取RSA公钥
+        self.RSA_PUBLIC_KEY = self._fetch_rsa_public_key()
+
+    def _fetch_rsa_public_key(self) -> str:
+        """动态获取RSA公钥"""
+        try:
+            from datetime import datetime
+            current_date = datetime.now().strftime("%Y%m%d")
+            js_url = f"https://pass.neu.edu.cn/tpass/comm/neu/js/login_neu.js?v={current_date}"
+            
+            response = self.session.get(js_url)
+            response.raise_for_status()
+            
+            # 从JS文件中提取publicKeyStr变量
+            import re
+            pattern = r'publicKeyStr\s*=\s*["\']([^"\']+)["\']'
+            match = re.search(pattern, response.text)
+            
+            if match:
+                public_key = match.group(1)
+                print(f"✅ 成功获取RSA公钥，长度: {len(public_key)}")
+                return public_key
+            else:
+                print("⚠️ 未找到publicKeyStr变量，使用默认公钥")
+                return self._get_default_rsa_public_key()
+        except Exception as e:
+            print(f"⚠️ 获取RSA公钥失败: {e}，使用默认公钥")
+            return self._get_default_rsa_public_key()
+
+    def _get_default_rsa_public_key(self) -> str:
+        """返回默认的RSA公钥"""
+        return "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnjA28DLKXZzxbKmo9/1WkVLf1mr+wtLXLXt6sC4WiBCtsbzF5ewm7ARZeAdS3iZtqlYPn6IcUoOw42H8nAK/tfFcIb6dZ1K0atn0U39oWCGPzYuKtLJeMuNZiDXVuAXtojrckOjLW9B3gUnaNGLuIx0fYe66l0o9WjU2cGLNZQfiIxs2h00z1EA9IdSnVxiVQWSD+lsP3JZXh2TT287la4Y4603SQNKTK/QvXfcmccwTEd1IW6HwGxD6QrkInBiHisKWxmveN7UDSaQRZ/J97G0YC32pD38WT53izXeK0p/kU/X37VP555um1wVWFvPIuc9I7gMP1+hq5a+X6c++tQIDAQAB"
     
     @staticmethod
     def _default_headers():
